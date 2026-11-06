@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""debug-lab2 - Debug Lab 2.0: DOS reversing workbench (2026 edition).
+
+Successor to the bash debug-lab. TUI (curses) + scriptable CLI subcommands.
+
+CLI:
+  debug-lab2 tui                     interactive workbench (default)
+  debug-lab2 run DIR "CMDLINE"       run windowed under DOSBox-X
+  debug-lab2 debug DIR "CMDLINE"     run under the DOSBox-X debugger
+  debug-lab2 capture DIR "CMDLINE"   headless run + text-screen capture
+  debug-lab2 caps                    list captures
+  debug-lab2 diff A B                unified diff of two captures
+  debug-lab2 inspect FILE.EXE        MZ / DJGPP-COFF / PE header report + strings
+  debug-lab2 disasm FILE.COM         disassemble a .COM (org 0x100)
+  debug-lab2 sessions                list saved sessions
+  debug-lab2 qcrack                  hand off to the QCRACK case-study bench
+"""
+import curses
+import difflib
+import json
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+LAB = HOME / "debug-lab"
+CAPS = LAB / "captures"
+PROGS = LAB / "progs"
+TOOLS = LAB / "tools"
+SESSIONS = LAB / "sessions.json"
+RUN = HOME / "reverse-qcrack/run"
+DOSBOX_X = HOME / ".local/bin/dosbox-x"
+SCRNDUMP_MSG = "T:\\SCRNDUMP.COM"
+
+
+def dosbox(args, headless=False, timeout=150):
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(HOME)}
+    if headless:
+        env["SDL_VIDEODRIVER"] = "dummy"
+        env["SDL_AUDIODRIVER"] = "dummy"
+    cmd = [str(DOSBOX_X), "-nopromptfolder"] + args
+    try:
+        subprocess.run(cmd, env=env, timeout=timeout,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        print("(dosbox-x hit the time limit)")
+
+
+def mount_args(dirpath):
+    d = str(Path(dirpath).expanduser().resolve())
+    return ["-c", f"mount c {d}", "-c", f"mount t {TOOLS}", "-c", "c:"]
+
+
+def cmd_run(directory, cmdline, debug=False):
+    args = mount_args(directory)
+    if debug:
+        print("  debugger: BPX <addr> | BP <seg:off> | BPINT <n> | T/P step | G go")
+        print("  MEMDUMPBIN <seg>:<off> <len> <file>  writes to HOST fs | Q quit\n")
+        dosbox(["-debug"] + args + ["-c", cmdline])
+    else:
+        dosbox(args + ["-c", cmdline])
+
+
+def cmd_capture(directory, cmdline):
+    d = Path(directory).expanduser().resolve()
+    (d / "SCRN.TXT").unlink(missing_ok=True)
+    args = mount_args(d) + ["-c", cmdline, "-c", SCRNDUMP_MSG, "-c", "exit"]
+    dosbox(args, headless=True)
+    scrn = d / "SCRN.TXT"
+    if not scrn.is_file():
+        print("(no text screen captured - graphics mode or waiting for input?)")
+        return
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = CAPS / f"{stamp}.txt"
+    dest.write_bytes(scrn.read_bytes())
+    text = scrn.read_bytes()[0::2].decode("cp437", errors="replace")
+    rows = [text[i:i + 80].rstrip() for i in range(0, 4000, 80)]
+    print("\n".join(r for r in rows if r.strip()))
+    print(f"\n[saved -> {dest.name}]")
+
+
+def cmd_caps():
+    files = sorted(CAPS.glob("*.txt"), reverse=True)
+    for i, f in enumerate(files[:20]):
+        print(f"  [{i}] {f.name}")
+    return files
+
+
+def cmd_diff(a, b):
+    fa, fb = CAPS / a, CAPS / b
+    if not fa.is_file() or not fb.is_file():
+        sys.exit("captures must be names under ~/debug-lab/captures")
+    ta = fa.read_bytes()[0::2].decode("cp437", errors="replace")
+    tb = fb.read_bytes()[0::2].decode("cp437", errors="replace")
+    ra = [ta[i:i + 80].rstrip() for i in range(0, 4000, 80)]
+    rb = [tb[i:i + 80].rstrip() for i in range(0, 4000, 80)]
+    for line in difflib.unified_diff(ra, rb, fromfile=a, tofile=b, lineterm=""):
+        print(line)
+
+
+def cmd_inspect(path):
+    p = Path(path).expanduser()
+    data = p.read_bytes()
+    print(f"== {p.name}: {len(data)} bytes ==")
+    if data[:2] != b"MZ":
+        print("not an MZ executable (COM file? raw binary?)")
+        return
+    hdr_par = struct.unpack_from("<H", data, 8)[0]
+    header_size = hdr_par * 16
+    lastb = struct.unpack_from("<H", data, 2)[0]
+    blocks = struct.unpack_from("<H", data, 4)[0]
+    total = blocks * 512 if lastb == 0 else (blocks - 1) * 512 + lastb
+    load_size = max(0, total - header_size)
+    ip = struct.unpack_from("<H", data, 20)[0]
+    cs = struct.unpack_from("<H", data, 22)[0]
+    print(f"MZ header: {header_size:#x} bytes, load module {load_size:#x} bytes, entry {cs:04x}:{ip:04x}")
+    # PE?
+    if len(data) > 0x40:
+        peoff = struct.unpack_from("<I", data, 0x3C)[0]
+        if peoff + 4 <= len(data) and data[peoff:peoff + 4] == b"PE\0\0":
+            print(f"PE executable at +{peoff:#x} (use objdump/ghidra for deep PE analysis)")
+            return
+    # scan for DJGPP COFF after the stub
+    for off in range(header_size, min(len(data) - 20, 0x2000), 0x10):
+        magic = struct.unpack_from("<H", data, off)[0]
+        if magic != 0x14C:
+            continue
+        nscns = struct.unpack_from("<H", data, off + 2)[0]
+        opthdr = struct.unpack_from("<H", data, off + 16)[0]
+        if not (0 < nscns <= 96 and opthdr in (0, 0x1C, 0x28)):
+            continue
+        aout = data[off + 20:off + 20 + opthdr]
+        entry = text_start = 0
+        if opthdr >= 0x1C:
+            entry, text_start = struct.unpack_from("<II", aout, 16)
+        print(f"COFF (DJGPP) at +{off:#x}: {nscns} sections, entry {entry:#x}, text {text_start:#x}")
+        sh = off + 20 + opthdr
+        for i in range(nscns):
+            name = data[sh:sh + 8].split(b"\0")[0].decode("ascii", "replace")
+            vaddr, size, rawptr = struct.unpack_from("<III", data, sh + 12)
+            print(f"  {name:8s} vaddr={vaddr:#010x} size={size:#x} raw@+{rawptr:#x}")
+            sh += 40
+        break
+    else:
+        print("(no PE/COFF detected - plain MZ or packed)")
+    print("\n== strings (>=5) ==")
+    run = bytearray()
+    out = 0
+    for b in data:
+        if 32 <= b < 127:
+            run.append(b)
+        else:
+            if len(run) >= 5:
+                print("  " + run.decode("ascii", "replace"))
+                out += 1
+                if out >= 25:
+                    print("  ...")
+                    break
+            run = bytearray()
+
+
+def cmd_disasm(path):
+    p = Path(path).expanduser()
+    if p.suffix.lower() != ".com":
+        sys.exit("disasm targets .COM files (org 0x100)")
+    out = subprocess.run(["objdump", "-D", "-b", "binary", "-m", "i8086", "-M", "intel",
+                          "--adjust-vma=0x100", str(p)],
+                         capture_output=True, text=True)
+    print(out.stdout[:8000])
+
+
+def load_sessions():
+    if SESSIONS.is_file():
+        return json.loads(SESSIONS.read_text())
+    return {}
+
+
+def cmd_sessions():
+    s = load_sessions()
+    if not s:
+        print("no sessions saved yet")
+    for name, v in s.items():
+        print(f"  {name}: [{v['dir']}] {v['cmd']}")
+
+
+def session_add(name, directory, cmdline):
+    s = load_sessions()
+    s[name] = {"dir": str(Path(directory).expanduser().resolve()), "cmd": cmdline}
+    SESSIONS.write_text(json.dumps(s, indent=2))
+    print(f"saved session '{name}'")
+
+
+def tui():
+    stdscr = curses.initscr()
+    curses.cbreak()
+    stdscr.keypad(True)
+    try:
+        tui_main(stdscr)
+    finally:
+        curses.endwin()
+
+
+def tui_main(stdscr):
+    sel = 0
+    programs = []
+    captures = sorted(CAPS.glob("*.txt"), reverse=True)
+    mode = "programs"
+
+    def scan():
+        nonlocal programs
+        programs = sorted(PROGS.glob("*.[eE][xX][eE]")) + sorted(PROGS.glob("*.[cC][oO][mM]"))
+        programs += sorted((HOME / "reverse-qcrack/run").glob("*.[eE][xX][eE]"))[:6]
+
+    scan()
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addstr(0, 0, " DEBUG LAB 2.0 ", curses.A_REVERSE)
+        stdscr.addstr(1, 0, "r run  d debug  c capture  i inspect  a disasm  s session  q quit | tab switch pane")
+        if mode == "programs":
+            stdscr.addstr(2, 0, f"-- programs ({len(programs)}) --", curses.A_BOLD)
+            for idx, p in enumerate(programs[:h - 6]):
+                mark = ">" if idx == sel else " "
+                stdscr.addstr(3 + idx, 0, f"{mark} {p.parent.name}/{p.name}"[:w - 1])
+        else:
+            stdscr.addstr(2, 0, f"-- captures ({len(captures)}) --", curses.A_BOLD)
+            for idx, p in enumerate(captures[:h - 6]):
+                mark = ">" if idx == sel else " "
+                stdscr.addstr(3 + idx, 0, f"{mark} {p.name}"[:w - 1])
+        stdscr.addstr(h - 2, 0, f"[{mode}] " + time.strftime("%H:%M:%S"))
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (ord("q"), 27):
+            return
+        if ch == ord("\t"):
+            mode = "captures" if mode == "programs" else "programs"
+            sel = 0
+        elif ch == curses.KEY_UP:
+            sel = max(0, sel - 1)
+        elif ch == curses.KEY_DOWN:
+            sel += 1
+        elif ch in (ord("r"), ord("d"), ord("c"), ord("i"), ord("a"), ord("s")):
+            curses.endwin()
+            try:
+                if mode == "programs" and programs:
+                    p = programs[min(sel, len(programs) - 1)]
+                    if ch == ord("i"):
+                        cmd_inspect(p)
+                    elif ch == ord("a"):
+                        cmd_disasm(p)
+                    else:
+                        extra = input("args (e.g. -g quake2 Q00000003900): ").strip()
+                        line = f"{p.name} {extra}".strip()
+                        if ch == ord("r"):
+                            cmd_run(p.parent, line)
+                        elif ch == ord("d"):
+                            cmd_run(p.parent, line, debug=True)
+                        else:
+                            cmd_capture(p.parent, line)
+                elif mode == "captures" and captures:
+                    p = captures[min(sel, len(captures) - 1)]
+                    cmd_diff(p.name, p.name) if False else print(p.read_bytes()[0::2].decode("cp437", "replace"))
+                if ch == ord("s"):
+                    name = input("session name: ").strip()
+                    if name:
+                        d = input("dir: ").strip()
+                        c = input("cmdline: ").strip()
+                        session_add(name, d or PROGS, c)
+            finally:
+                stdscr.refresh()
+                curses.doupdate()
+                captures = sorted(CAPS.glob("*.txt"), reverse=True)
+                scan()
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] == "tui":
+        tui()
+        return
+    cmd, rest = args[0], args[1:]
+    if cmd == "run":
+        cmd_run(rest[0], rest[1])
+    elif cmd == "debug":
+        cmd_run(rest[0], rest[1], debug=True)
+    elif cmd == "capture":
+        cmd_capture(rest[0], rest[1])
+    elif cmd == "caps":
+        cmd_caps()
+    elif cmd == "diff":
+        cmd_diff(rest[0], rest[1])
+    elif cmd == "inspect":
+        cmd_inspect(rest[0])
+    elif cmd == "disasm":
+        cmd_disasm(rest[0])
+    elif cmd == "sessions":
+        cmd_sessions()
+    elif cmd == "qcrack":
+        os_exec_qcrack()
+    else:
+        sys.exit(__doc__)
+
+
+def os_exec_qcrack():
+    subprocess.run([str(HOME / "bin/qcrack-lab")])
+
+
+if __name__ == "__main__":
+    main()

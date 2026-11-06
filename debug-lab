@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# debug-lab - universal DOS reversing & debugging workbench.
+# Born from the QCRACK reversing project: run any DOS program under DOSBox-X
+# (built from source with the debugger), capture its text screen, or drive the
+# full interactive debugger. SCRNDUMP.COM on drive T: copies the 80x25 text
+# screen to SCREEN.TXT in the program's own directory.
+set -u
+LAB="$HOME/debug-lab"
+RUN="$HOME/reverse-qcrack/run"
+DOSBOXX="$HOME/.local/bin/dosbox-x"
+CAPS="$LAB/captures"
+
+capture() {  # $1=dir $2=command line  ->  SCRN.TXT in $1, copy in $CAPS
+  local dir="$1" cmd="$2"
+  rm -f "$dir/SCRN.TXT"
+  SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy timeout -k 5 120 "$DOSBOXX" \
+    -nopromptfolder -c "mount c \"$dir\"" -c "mount t $LAB/tools" -c "c:" \
+    -c "$cmd" -c "T:SCRNDUMP.COM" -c "exit" > /dev/null 2>&1
+  if [ -f "$dir/SCRN.TXT" ]; then
+    cp "$dir/SCRN.TXT" "$CAPS/$(date +%Y%m%d-%H%M%S).txt"
+    python3 - "$dir/SCRN.TXT" <<'EOF'
+import sys
+data = open(sys.argv[1],'rb').read()
+text = data[0::2].decode('cp437', errors='replace')
+rows = [text[i:i+80].rstrip() for i in range(0, 4000, 80)]
+print('\n'.join(r for r in rows if r.strip()))
+EOF
+  else
+    echo "(no screen output captured - program may need graphics mode or keyboard input)"
+  fi
+}
+
+debugger_hint() {
+  cat <<'EOF'
+  DOSBox-X debugger quick reference:
+    BPX <addr>      breakpoint at linear address   (BPX 2c66)
+    BP <seg:off>    breakpoint at seg:off          (BP 0b80:0100)
+    BPINT <n>       break on interrupt             (BPINT 21)
+    T / P           trace / step over        G     go (run)
+    R               show registers           D <seg:off>  memory view
+    MEMDUMPBIN <seg>:<off> <len> <file>   <-- writes to HOST filesystem
+    Q               quit debugger
+  Close the DOSBox-X window when done.
+EOF
+}
+
+cat <<'EOF'
+=========================================
+   DEBUG LAB - DOS reversing workbench
+=========================================
+EOF
+
+while true; do
+  cat <<'EOF'
+
+  [1] Run a DOS program (windowed)
+  [2] Debug a DOS program (DOSBox-X debugger)
+  [3] Run headless + capture text screen
+  [4] List previous captures
+  [5] Open lab folders (file manager)
+  [9] QCRACK case study (1996 GNOMON keygen bench)
+  [0] Quit
+
+EOF
+  printf 'choose: '
+  read -r choice
+  case "$choice" in
+    1|2|3)
+      printf 'program directory [%s/progs]: ' "$LAB"
+      read -r dir; dir=${dir:-"$LAB/progs"}; dir="${dir/#\~/$HOME}"
+      [ -d "$dir" ] || { echo "no such directory: $dir"; continue; }
+      ls -1 "$dir" | grep -iE '\.(exe|com|bat)$' | head -10 | sed 's/^/  /'
+      printf 'command line (e.g. QCRACK.EXE -g quake2 Q00000003900): '
+      read -r cmd
+      [ -n "$cmd" ] || continue
+      case "$choice" in
+        1) "$DOSBOXX" -nopromptfolder -c "mount c \"$dir\"" -c "mount t $LAB/tools" \
+             -c "c:" -c "$cmd" > /dev/null 2>&1 ;;
+        2) debugger_hint
+           "$DOSBOXX" -debug -nopromptfolder -c "mount c \"$dir\"" -c "mount t $LAB/tools" \
+             -c "c:" -c "$cmd" > /dev/null 2>&1 ;;
+        3) capture "$dir" "$cmd" ;;
+      esac ;;
+    4) ls -1t "$CAPS" | head -10 | sed 's/^/  /'
+       printf 'view which? (name or Enter to skip): '
+       read -r name
+       [ -n "$name" ] && [ -f "$CAPS/$name" ] && less "$CAPS/$name" ;;
+    5) xdg-open "$LAB" > /dev/null 2>&1 ;;
+    9) exec "$HOME/bin/qcrack-lab" ;;
+    0|q|quit) exit 0 ;;
+  esac
+done
